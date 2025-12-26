@@ -9,56 +9,68 @@ import time
 import random
 import json
 import os
+from zoneinfo import ZoneInfo
+
+# ===============================
+# ✅ ZONA HORARIA (Bogotá UTC-5)
+# ===============================
+TZ = ZoneInfo("America/Bogota")
 
 # ===============================
 # ✅ CLAVES DESDE VARIABLES (Railway)
+#   OJO: aquí van LOS NOMBRES, no las claves.
 # ===============================
 TOKEN = os.getenv("TOKEN")
 AV_KEY = os.getenv("AV_KEY")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 TWELVE_KEY = os.getenv("TWELVE_KEY")
+CHAT_ID_RAW = os.getenv("CHAT_ID")  # debe ser número (ej: -100xxxxxxxxxx)
 
-# ✅ ID DEL CANAL (como número)
-CHAT_ID_STR = os.getenv("CHAT_ID")
-CHAT_ID = int(CHAT_ID_STR) if CHAT_ID_STR else 0
-
-# Validación rápida
+# ✅ Validación rápida (mensaje claro si falta algo)
 missing = [k for k, v in {
     "TOKEN": TOKEN,
     "AV_KEY": AV_KEY,
     "FINNHUB_KEY": FINNHUB_KEY,
     "TWELVE_KEY": TWELVE_KEY,
-    "CHAT_ID": (None if CHAT_ID == 0 else str(CHAT_ID)),
+    "CHAT_ID": CHAT_ID_RAW
 }.items() if not v]
 
 if missing:
     raise RuntimeError(
         "Faltan Variables en Railway: " + ", ".join(missing) +
-        " | Ve a Railway -> Variables y agrégalas con esos mismos nombres."
+        " | Ve a Railway -> Variables y agrégalas EXACTO con esos nombres."
     )
+
+try:
+    CHAT_ID = int(CHAT_ID_RAW)
+except ValueError:
+    raise RuntimeError("CHAT_ID debe ser un número. Ej: -1001234567890")
 
 # ===== CONTADOR PERSISTENTE =====
 COUNTER_FILE = "counter.json"
 RESET_HOUR = 0
-RESET_MINUTE = 1  # 00:01 AM
+RESET_MINUTE = 1  # 00:01 AM Bogotá
 # ===============================
 
-# Última dirección real de tendencia (para fallback si fallan las velas)
+# Última tendencia real (fallback si se caen velas)
 LAST_UPTREND = None
 
-# Guardar el último par usado para NO repetir
-LAST_PAIR = None
+# Evitar pares seguidos
+LAST_PAIR_SENT = None
 
 # ======== PARES SEGÚN HORARIO ========
 PAIRS_NORMAL = ["EUR/USD", "EUR/GBP", "EUR/JPY", "GBP/USD"]
-PAIRS_OTC = ["EUR/USD OTC", "EUR/GBP OTC", "EUR/JPY OTC", "GBP/USD OTC"]
+PAIRS_OTC    = ["EUR/USD OTC", "EUR/GBP OTC", "EUR/JPY OTC", "GBP/USD OTC"]
+
+def now_bogota() -> datetime:
+    return datetime.now(TZ)
 
 def get_active_pairs():
-    """Devuelve la lista de pares según la hora actual 🇨🇴 UTC-5."""
-    now = datetime.now().hour
-    if 0 <= now < 15:
+    """Devuelve la lista de pares según la hora actual (Bogotá)."""
+    hour = now_bogota().hour
+    if 0 <= hour < 15:
         return PAIRS_NORMAL
-    elif 15 <= now < 19:
+    elif 15 <= hour < 19:
         return PAIRS_OTC
     else:
         return PAIRS_NORMAL
@@ -70,7 +82,6 @@ def load_counter():
         with open(COUNTER_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
         return data
-
     with open(COUNTER_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -79,17 +90,17 @@ def save_counter(data):
         json.dump(data, f)
 
 def get_and_increment_counter():
-    now = datetime.now()
-    today_str = str(date.today())
+    now = now_bogota()
+    today_str = str(now.date())
     data = load_counter()
 
-    # Si cambió el día, preparamos reset (pero no resetea hasta 00:01)
+    # Si cambió el día, preparamos reset (pero NO reseteamos hasta 00:01)
     if data.get("date") != today_str:
         data["date"] = today_str
         data["reset_done"] = False
         save_counter(data)
 
-    # Reset SOLO a las 00:01 y SOLO una vez
+    # Reset SOLO a las 00:01 (una sola vez)
     if (
         now.hour == RESET_HOUR
         and now.minute == RESET_MINUTE
@@ -121,24 +132,20 @@ def to_unix_range(minutes_back=240):
 
 def fetch_intraday_fx(a, b, interval="1min", output_size="compact"):
     errors = []
-
-    # 1) Alpha
     try:
         return fetch_from_alpha(a, b, interval, output_size)
     except Exception as e:
-        errors.append("Alpha: " + str(e))
+        errors.append(f"Alpha: {e}")
 
-    # 2) Finnhub
     try:
         return fetch_from_finnhub(a, b, "1")
     except Exception as e:
-        errors.append("Finnhub: " + str(e))
+        errors.append(f"Finnhub: {e}")
 
-    # 3) TwelveData
     try:
         return fetch_from_twelve(a, b, "1min", 500)
     except Exception as e:
-        errors.append("Twelve: " + str(e))
+        errors.append(f"Twelve: {e}")
 
     raise ValueError("Sin datos disponibles: " + " | ".join(errors))
 
@@ -153,18 +160,15 @@ def fetch_from_alpha(a, b, interval, output_size):
 
     key = f"Time Series FX ({interval})"
     if key not in data:
-        raise ValueError("sin data")
+        raise ValueError("Alpha no data")
 
     df = (
-        pd.DataFrame(data[key]).T
-        .rename(columns={
+        pd.DataFrame(data[key]).T.rename(columns={
             "1. open": "open",
             "2. high": "high",
             "3. low": "low",
             "4. close": "close"
-        })
-        .astype(float)
-        .sort_index()
+        }).astype(float).sort_index()
     )
     df.index = pd.to_datetime(df.index)
     return df
@@ -172,16 +176,12 @@ def fetch_from_alpha(a, b, interval, output_size):
 def fetch_from_finnhub(a, b, interval):
     sym = map_symbol_for_finnhub(a, b)
     _from, _to = to_unix_range(24 * 60)
-
-    url = (
-        f"https://finnhub.io/api/v1/forex/candle"
-        f"?symbol={sym}&resolution={interval}&from={_from}&to={_to}&token={FINNHUB_KEY}"
-    )
+    url = f"https://finnhub.io/api/v1/forex/candle?symbol={sym}&resolution={interval}&from={_from}&to={_to}&token={FINNHUB_KEY}"
     r = requests.get(url, timeout=20)
     data = r.json()
 
     if not data or data.get("s") != "ok":
-        raise ValueError("sin datos")
+        raise ValueError("Finnhub sin datos")
 
     df = pd.DataFrame(
         {"open": data["o"], "high": data["h"], "low": data["l"], "close": data["c"]},
@@ -200,21 +200,19 @@ def fetch_from_twelve(a, b, interval, size):
     data = r.json()
 
     if "values" not in data:
-        raise ValueError("sin datos")
+        raise ValueError("Twelve sin datos")
 
     df = pd.DataFrame(data["values"]).rename(columns={"datetime": "ts"})
     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
     df["ts"] = pd.to_datetime(df["ts"])
     return df.set_index("ts").sort_index()
 
-# ---------- ESTRATEGIA (EMA con pandas puro) ----------
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
-
+# ---------- ESTRATEGIA (SIN pandas_ta) ----------
 def triple_confirmation_signal(df: pd.DataFrame) -> bool:
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    return df["ema20"].iloc[-1] > df["ema50"].iloc[-1]
+    close = df["close"]
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    return ema20.iloc[-1] > ema50.iloc[-1]
 
 # ---------- ARMAR SEÑAL ----------
 def build_signal(pair: str):
@@ -236,8 +234,8 @@ def build_signal(pair: str):
     direccion = "CALL" if uptrend else "PUT"
     color = "🟢" if uptrend else "🔴"
 
-    # ✅ +4 minutos (antes estaba +5)
-    entry_time = (datetime.now() + timedelta(minutes=4)).strftime("%H:%M")
+    # ✅ antes era +5, ahora +4 minutos
+    entry_time = (now_bogota() + timedelta(minutes=4)).strftime("%H:%M")
 
     return (
         "🔱 ARKANE BOT 🦂\n"
@@ -251,20 +249,23 @@ def build_signal(pair: str):
         "⚠️ Opera con responsabilidad. Gestiona tu riesgo."
     )
 
-# ---------- AUTO-SEÑALES ----------
 def pick_pair_no_repeat(active_pairs):
-    global LAST_PAIR
+    global LAST_PAIR_SENT
     if not active_pairs:
         return None
     if len(active_pairs) == 1:
-        LAST_PAIR = active_pairs[0]
-        return LAST_PAIR
+        return active_pairs[0]
 
-    choices = [p for p in active_pairs if p != LAST_PAIR]
-    pair = random.choice(choices) if choices else random.choice(active_pairs)
-    LAST_PAIR = pair
+    # Elegir diferente al anterior
+    options = [p for p in active_pairs if p != LAST_PAIR_SENT]
+    if not options:
+        options = active_pairs[:]  # fallback
+
+    pair = random.choice(options)
+    LAST_PAIR_SENT = pair
     return pair
 
+# ---------- AUTO-SEÑALES ----------
 async def auto_signals(app: Application):
     while True:
         try:
@@ -279,9 +280,8 @@ async def auto_signals(app: Application):
                 disable_web_page_preview=True
             )
 
-            # 2–3–4 min
-            wait = random.choice([120, 180, 240])
-            await asyncio.sleep(wait)
+            # 2–3–4 min (como querías)
+            await asyncio.sleep(random.choice([120, 180, 240]))
 
         except Exception as e:
             print("Error en auto_signals:", e)
@@ -322,8 +322,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🔥 ARKANE BOT ACTIVADO – Señales en tiempo real")
+    print("🔥 ARKANE BOT ACTIVADO – Señales en tiempo real (Railway)")
 
+    # ✅ Esto requiere job-queue instalado (lo ponemos en requirements)
     app.job_queue.run_once(lambda *_: asyncio.create_task(auto_signals(app)), when=1)
 
     app.run_polling()
