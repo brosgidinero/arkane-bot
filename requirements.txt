@@ -1,3 +1,4 @@
-python-telegram-bot==20.7
-requests
-pandas
+python-telegram-bot[job-queue]==20.7
+requests==2.32.5
+pandas==2.2.3
+tzdata==2025.2
