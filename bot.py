@@ -102,18 +102,30 @@ def save_counter(data):
         json.dump(data, f)
 
 def get_and_increment_counter():
+    """
+    ✅ FIX: Reset inteligente.
+    - Ya no depende de caer EXACTO en 00:01.
+    - Si el bot estaba dormido, resetea apenas vuelva a ejecutar luego de 00:01.
+    """
     now = now_utc5()
+    today_str = str(today_utc5())
     data = load_counter()
 
-    if data["date"] != str(today_utc5()):
-        data["date"] = str(today_utc5())
+    # Si cambió el día, habilitamos el reset para el nuevo día
+    if data.get("date") != today_str:
+        data["date"] = today_str
         data["reset_done"] = False
+        save_counter(data)
 
-    if now.hour == RESET_HOUR and now.minute == RESET_MINUTE and not data["reset_done"]:
+    # ✅ Reset "si ya pasó 00:01 y aún no se hizo hoy"
+    reset_time_reached = (now.hour > RESET_HOUR) or (now.hour == RESET_HOUR and now.minute >= RESET_MINUTE)
+    if reset_time_reached and not data.get("reset_done", False):
         data["count"] = 0
         data["reset_done"] = True
+        save_counter(data)
 
-    data["count"] += 1
+    # Incrementar contador
+    data["count"] = int(data.get("count", 0)) + 1
     save_counter(data)
     return data["count"]
 
