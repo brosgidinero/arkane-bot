@@ -8,18 +8,16 @@ from datetime import datetime, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
-# ✅ Importante para manejar timeouts/reintentos de Telegram (PTB v20+)
-from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError, RetryAfter
+from telegram.request import HTTPXRequest
 
 # ===============================
 # 🔐 VARIABLES (Railway)
 # ===============================
-TOKEN = (os.getenv("TOKEN") or "").strip()
-AV_KEY = (os.getenv("AV_KEY") or "").strip()
-FINNHUB_KEY = (os.getenv("FINNHUB_KEY") or "").strip()
-TWELVE_KEY = (os.getenv("TWELVE_KEY") or "").strip()
+TOKEN = os.getenv("TOKEN")
+AV_KEY = os.getenv("AV_KEY")
+FINNHUB_KEY = os.getenv("FINNHUB_KEY")
+TWELVE_KEY = os.getenv("TWELVE_KEY")
 
 _raw_chat_id = (os.getenv("CHAT_ID") or "").strip()
 try:
@@ -27,19 +25,11 @@ try:
 except Exception:
     CHAT_ID = None
 
-REQUIRED = {
-    "TOKEN": TOKEN,
-    "AV_KEY": AV_KEY,
-    "FINNHUB_KEY": FINNHUB_KEY,
-    "TWELVE_KEY": TWELVE_KEY,
-}
-
+REQUIRED = {"TOKEN": TOKEN, "AV_KEY": AV_KEY, "FINNHUB_KEY": FINNHUB_KEY, "TWELVE_KEY": TWELVE_KEY}
 missing = [k for k, v in REQUIRED.items() if not v]
-# Nota: NO mandamos nada a Telegram si falta algo. Solo logs en Railway.
 if missing:
     print("❌ FALTAN VARIABLES:", ", ".join(missing))
-if CHAT_ID is None:
-    print("❌ CHAT_ID inválido o vacío. Auto-señales desactivadas.")
+    print("⚠️ El bot arrancará SIN auto-señales")
 
 # ===============================
 # ⏰ TIME UTC-5
@@ -55,7 +45,7 @@ def today_utc5():
 # ===============================
 COUNTER_FILE = "counter.json"
 RESET_HOUR = 0
-RESET_MINUTE = 1  # 00:01 UTC-5
+RESET_MINUTE = 1
 
 LAST_UPTREND = None
 LAST_PAIR_SENT = None
@@ -70,12 +60,11 @@ PAIRS_OTC = ["EUR/USD OTC", "EUR/GBP OTC", "EUR/JPY OTC", "GBP/USD OTC"]
 def is_otc_weekend():
     now = now_utc5()
     wd = now.weekday()  # 0=lun ... 4=vie ... 6=dom
-
-    if wd == 4 and now.hour >= 13:  # viernes desde 13:00
+    if wd == 4 and now.hour >= 13:
         return True
-    if wd == 5:  # sábado completo
+    if wd == 5:
         return True
-    if wd == 6 and now.hour < 19:  # domingo hasta 19:00
+    if wd == 6 and now.hour < 19:
         return True
     return False
 
@@ -92,7 +81,7 @@ def get_active_pairs():
         return PAIRS_NORMAL
 
 # ===============================
-# 🔢 CONTADOR (reset inteligente)
+# 🔢 CONTADOR (reset robusto)
 # ===============================
 def load_counter():
     if not os.path.exists(COUNTER_FILE):
@@ -111,18 +100,19 @@ def get_and_increment_counter():
     """
     ✅ Reset inteligente:
     - No depende de caer EXACTO en 00:01.
-    - Si el bot se “duerme”, resetea al primer tick después de 00:01.
+    - Si el bot estuvo dormido, resetea apenas vuelva a correr luego de 00:01.
     """
     now = now_utc5()
     today_str = str(today_utc5())
     data = load_counter()
 
-    # Si cambió el día => permitir reset para hoy
+    # Cambio de día: habilitar reset para el nuevo día
     if data.get("date") != today_str:
         data["date"] = today_str
         data["reset_done"] = False
         save_counter(data)
 
+    # Reset si ya pasó 00:01 y aún no se hizo hoy
     reset_time_reached = (now.hour > RESET_HOUR) or (now.hour == RESET_HOUR and now.minute >= RESET_MINUTE)
     if reset_time_reached and not data.get("reset_done", False):
         data["count"] = 0
@@ -153,12 +143,11 @@ def trend_from_closes(closes):
     return e20 > e50
 
 # ===============================
-# 📡 DATA FETCH (Alpha)
+# 📡 DATA FETCH
 # ===============================
 def base_symbol(pair):
     p = pair.replace(" OTC", "")
-    a, b = p.split("/")
-    return a, b
+    return p.split("/")
 
 def fetch_alpha(a, b):
     url = (
@@ -170,18 +159,17 @@ def fetch_alpha(a, b):
     key = "Time Series FX (1min)"
     if key not in r:
         raise ValueError("Alpha sin datos")
-    items = sorted(r[key].items())  # ascendente
+    items = sorted(r[key].items())
     return [float(v["4. close"]) for _, v in items]
 
 def fetch_intraday_closes(a, b):
     return fetch_alpha(a, b)
 
 # ===============================
-# 🧠 SEÑAL (+4 min)
+# 🧠 SEÑAL
 # ===============================
 def build_signal(pair):
     global LAST_UPTREND
-
     count = get_and_increment_counter()
     a, b = base_symbol(pair)
 
@@ -220,42 +208,34 @@ def pick_pair(pairs):
     return LAST_PAIR_SENT
 
 # ===============================
-# 📤 ENVÍO ROBUSTO (NO CRASHEA)
-# - reintentos con backoff
-# - no manda mensajes extra al canal, solo la señal cuando se puede
+# ✅ ENVÍO ROBUSTO (no muere por Telegram)
 # ===============================
-async def send_signal_with_retry(app: Application, text: str):
-    delay = 5
-    max_delay = 120  # tope 2 min entre reintentos (evita quedarse “mudo” mucho tiempo)
-
+async def send_with_retry(app: Application, chat_id: int, text: str):
+    backoff = 2
     while True:
         try:
-            await app.bot.send_message(chat_id=CHAT_ID, text=text, disable_web_page_preview=True)
-            return  # ✅ enviado
+            await app.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+            return
         except RetryAfter as e:
-            # Telegram pidió esperar (rate limit)
-            wait = int(getattr(e, "retry_after", 5))
-            await asyncio.sleep(max(5, min(wait, 60)))
+            wait = int(getattr(e, "retry_after", 5)) + 1
+            print(f"⚠️ Telegram RetryAfter. Esperando {wait}s...")
+            await asyncio.sleep(wait)
         except (TimedOut, NetworkError) as e:
-            # Red/Telegram inestable: reintenta sin morirse
-            print(f"⚠️ Telegram timeout/red. Reintentando en {delay}s... {repr(e)}")
-            await asyncio.sleep(delay)
-            delay = min(max_delay, int(delay * 1.6))
+            print(f"⚠️ Telegram timeout/red. Reintentando en {backoff}s... {repr(e)}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
         except Exception as e:
-            # Cualquier otro error: no crashea, solo espera y reintenta
-            print(f"⚠️ Error enviando a Telegram. Reintentando en {delay}s... {repr(e)}")
-            await asyncio.sleep(delay)
-            delay = min(max_delay, int(delay * 1.6))
+            # Cualquier cosa inesperada: reintenta sin matar el proceso
+            print(f"⚠️ Error enviando a Telegram. Reintentando en {backoff}s... {repr(e)}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 # ===============================
-# 🚀 AUTO-SEÑALES (NUNCA SE DETIENE)
+# 🚀 AUTO-SEÑALES (siempre vivo)
 # ===============================
 async def auto_signals(app: Application):
     if CHAT_ID is None:
         print("⚠️ Auto-señales desactivadas (CHAT_ID)")
-        return
-    if missing:
-        print("⚠️ Auto-señales desactivadas (faltan API keys)")
         return
 
     while True:
@@ -263,18 +243,19 @@ async def auto_signals(app: Application):
             pair = pick_pair(get_active_pairs())
             msg = await asyncio.to_thread(build_signal, pair)
 
-            # ✅ envío robusto
-            await send_signal_with_retry(app, msg)
+            # Enviar robusto (no se cae por Telegram)
+            await send_with_retry(app, CHAT_ID, msg)
 
-            # ✅ ritmo
-            await asyncio.sleep(random.choice([120, 180, 240]))  # 2–3–4 min
+            # ritmo 2–3–4 min
+            await asyncio.sleep(random.choice([120, 180, 240]))
+
         except Exception as e:
-            # ✅ pase lo que pase, NO se muere
-            print("Auto loop error:", repr(e))
+            # Nunca muere: si algo explota, respira y sigue
+            print("⚠️ Auto loop error:", repr(e))
             await asyncio.sleep(5)
 
 # ===============================
-# 📟 MENÚ MANUAL (solo si te escriben)
+# 📟 MENÚ
 # ===============================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pairs = get_active_pairs()
@@ -284,48 +265,58 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt not in get_active_pairs():
+    if update.message.text not in get_active_pairs():
         await update.message.reply_text("Par no disponible ahora.")
         return
-    msg = await asyncio.to_thread(build_signal, txt)
+    msg = await asyncio.to_thread(build_signal, update.message.text)
     await update.message.reply_text(msg)
 
 # ===============================
-# 🟢 MAIN (supervisor + timeouts altos)
+# 🟢 MAIN (arranque correcto, sin warnings)
 # ===============================
-async def post_init(app: Application):
-    # NO manda mensajes al canal, solo arranca el loop interno
-    asyncio.create_task(auto_signals(app))
+async def run_bot_forever():
+    # Timeouts más largos para evitar TimedOut en getMe/startup
+    request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
 
-def build_app():
-    # ✅ timeouts altos para reducir “TimedOut” falsos
-    req = HTTPXRequest(
-        connect_timeout=20,
-        read_timeout=30,
-        write_timeout=30,
-        pool_timeout=30,
-        connection_pool_size=20,
-    )
-    return (
-        Application.builder()
-        .token(TOKEN)
-        .request(req)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).request(request).build()
 
-def main():
-    # ✅ Supervisor: si Telegram se cae al iniciar, vuelve a intentar
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Arranque manual (evita "coroutine was never awaited")
     while True:
         try:
-            app = build_app()
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            app.run_polling(close_loop=False)
+            print("🔥 ARKANE BOT ONLINE (Railway)")
+            await app.initialize()
+            await app.start()
+            # Inicia polling y espera idle
+            await app.updater.start_polling(drop_pending_updates=True)
+            asyncio.create_task(auto_signals(app))
+            await app.updater.idle()
+        except (TimedOut, NetworkError) as e:
+            print(f"⚠️ Telegram timeout/red en main. Reiniciando en 10s... {repr(e)}")
+            await asyncio.sleep(10)
         except Exception as e:
-            print("🔥 Supervisor restart por error:", repr(e))
-            time.sleep(10)
+            print(f"⚠️ Error main inesperado. Reiniciando en 10s... {repr(e)}")
+            await asyncio.sleep(10)
+        finally:
+            try:
+                await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("Falta TOKEN")
+    asyncio.run(run_bot_forever())
 
 if __name__ == "__main__":
     main()
