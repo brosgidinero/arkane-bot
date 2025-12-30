@@ -6,18 +6,15 @@ import asyncio
 import requests
 from datetime import datetime, timedelta
 
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.error import TimedOut, NetworkError, RetryAfter
-from telegram.request import HTTPXRequest
+from telegram.ext import Application
 
 # ===============================
 # 🔐 VARIABLES (Railway)
 # ===============================
-TOKEN = os.getenv("TOKEN")
-AV_KEY = os.getenv("AV_KEY")
-FINNHUB_KEY = os.getenv("FINNHUB_KEY")
-TWELVE_KEY = os.getenv("TWELVE_KEY")
+TOKEN = (os.getenv("TOKEN") or "").strip()
+AV_KEY = (os.getenv("AV_KEY") or "").strip()
+FINNHUB_KEY = (os.getenv("FINNHUB_KEY") or "").strip()
+TWELVE_KEY = (os.getenv("TWELVE_KEY") or "").strip()
 
 _raw_chat_id = (os.getenv("CHAT_ID") or "").strip()
 try:
@@ -25,27 +22,25 @@ try:
 except Exception:
     CHAT_ID = None
 
-REQUIRED = {"TOKEN": TOKEN, "AV_KEY": AV_KEY, "FINNHUB_KEY": FINNHUB_KEY, "TWELVE_KEY": TWELVE_KEY}
-missing = [k for k, v in REQUIRED.items() if not v]
-if missing:
-    print("❌ FALTAN VARIABLES:", ", ".join(missing))
-    print("⚠️ El bot arrancará SIN auto-señales")
+# Si falta algo CRÍTICO, crashea para que Railway reinicie (NO manda nada a Telegram)
+if not TOKEN or CHAT_ID is None:
+    raise RuntimeError("Missing TOKEN or CHAT_ID environment variables.")
 
 # ===============================
-# ⏰ TIME UTC-5
+# ⏰ TIME UTC-5 (Bogotá)
 # ===============================
 def now_utc5():
     return datetime.utcnow() - timedelta(hours=5)
 
-def today_utc5():
-    return now_utc5().date()
+def today_utc5_str():
+    return str(now_utc5().date())
 
 # ===============================
 # 📊 CONFIG
 # ===============================
 COUNTER_FILE = "counter.json"
 RESET_HOUR = 0
-RESET_MINUTE = 1
+RESET_MINUTE = 1  # 00:01
 
 LAST_UPTREND = None
 LAST_PAIR_SENT = None
@@ -53,13 +48,29 @@ LAST_PAIR_SENT = None
 PAIRS_NORMAL = ["EUR/USD", "EUR/GBP", "EUR/JPY", "GBP/USD"]
 PAIRS_OTC = ["EUR/USD OTC", "EUR/GBP OTC", "EUR/JPY OTC", "GBP/USD OTC"]
 
+# Señales cada 2–3–4 min (tú ya lo tenías)
+WAIT_OPTIONS = [120, 180, 240]
+
+# ✅ Watchdog anti-freeze:
+# Si pasa más de este tiempo sin una señal ENVIADA, forzamos reinicio (silencioso)
+MAX_SILENCE_SECONDS = 9 * 60  # 9 minutos (seguro con waits de 4 min)
+
+# Timeouts para evitar bloqueos
+BUILD_SIGNAL_TIMEOUT = 45  # seg
+SEND_TIMEOUT = 25          # seg
+FETCH_TIMEOUT = 18         # seg (requests)
+
+# Track de última señal enviada (para watchdog)
+LAST_SIGNAL_TS = time.time()
+
 # ===============================
 # 📆 HORARIO OTC REAL
-# Viernes 13:00 → Domingo 19:00 (UTC-5)
+# Viernes 13:00 → Domingo 19:00
 # ===============================
 def is_otc_weekend():
     now = now_utc5()
     wd = now.weekday()  # 0=lun ... 4=vie ... 6=dom
+
     if wd == 4 and now.hour >= 13:
         return True
     if wd == 5:
@@ -81,16 +92,24 @@ def get_active_pairs():
         return PAIRS_NORMAL
 
 # ===============================
-# 🔢 CONTADOR (reset robusto)
+# 🔢 CONTADOR (Reset inteligente)
 # ===============================
 def load_counter():
     if not os.path.exists(COUNTER_FILE):
-        data = {"date": str(today_utc5()), "count": 0, "reset_done": False}
+        data = {"date": today_utc5_str(), "count": 0, "reset_done": False}
         with open(COUNTER_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
         return data
-    with open(COUNTER_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+    try:
+        with open(COUNTER_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # si se corrompe por un corte, lo reiniciamos seguro
+        data = {"date": today_utc5_str(), "count": 0, "reset_done": False}
+        with open(COUNTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return data
 
 def save_counter(data):
     with open(COUNTER_FILE, "w", encoding="utf-8") as f:
@@ -99,21 +118,22 @@ def save_counter(data):
 def get_and_increment_counter():
     """
     ✅ Reset inteligente:
-    - No depende de caer EXACTO en 00:01.
-    - Si el bot estuvo dormido, resetea apenas vuelva a correr luego de 00:01.
+    - NO depende de ejecutarse EXACTO en 00:01.
+    - Si ya pasó 00:01 y hoy aún no se reseteó, resetea en la siguiente ejecución.
     """
     now = now_utc5()
-    today_str = str(today_utc5())
+    today_str = today_utc5_str()
     data = load_counter()
 
-    # Cambio de día: habilitar reset para el nuevo día
+    # Si cambió el día, habilitar reset
     if data.get("date") != today_str:
         data["date"] = today_str
         data["reset_done"] = False
         save_counter(data)
 
-    # Reset si ya pasó 00:01 y aún no se hizo hoy
     reset_time_reached = (now.hour > RESET_HOUR) or (now.hour == RESET_HOUR and now.minute >= RESET_MINUTE)
+
+    # Reset una sola vez al día cuando ya pasó 00:01
     if reset_time_reached and not data.get("reset_done", False):
         data["count"] = 0
         data["reset_done"] = True
@@ -143,7 +163,7 @@ def trend_from_closes(closes):
     return e20 > e50
 
 # ===============================
-# 📡 DATA FETCH
+# 📡 DATA FETCH (con timeout)
 # ===============================
 def base_symbol(pair):
     p = pair.replace(" OTC", "")
@@ -155,7 +175,7 @@ def fetch_alpha(a, b):
         f"?function=FX_INTRADAY&from_symbol={a}&to_symbol={b}"
         f"&interval=1min&apikey={AV_KEY}&outputsize=compact"
     )
-    r = requests.get(url, timeout=20).json()
+    r = requests.get(url, timeout=FETCH_TIMEOUT).json()
     key = "Time Series FX (1min)"
     if key not in r:
         raise ValueError("Alpha sin datos")
@@ -163,13 +183,15 @@ def fetch_alpha(a, b):
     return [float(v["4. close"]) for _, v in items]
 
 def fetch_intraday_closes(a, b):
+    # (Mantengo Alpha como fuente principal porque así lo tienes estable)
     return fetch_alpha(a, b)
 
 # ===============================
-# 🧠 SEÑAL
+# 🧠 SEÑAL (+4 min)
 # ===============================
 def build_signal(pair):
     global LAST_UPTREND
+
     count = get_and_increment_counter()
     a, b = base_symbol(pair)
 
@@ -208,115 +230,68 @@ def pick_pair(pairs):
     return LAST_PAIR_SENT
 
 # ===============================
-# ✅ ENVÍO ROBUSTO (no muere por Telegram)
+# 🛡️ WATCHDOG (SILENCIOSO)
+# Si pasan > MAX_SILENCE_SECONDS sin enviar señal,
+# forzamos reinicio para que Railway lo levante otra vez.
+# NO manda nada a Telegram.
 # ===============================
-async def send_with_retry(app: Application, chat_id: int, text: str):
-    backoff = 2
+async def watchdog():
+    global LAST_SIGNAL_TS
     while True:
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
-            return
-        except RetryAfter as e:
-            wait = int(getattr(e, "retry_after", 5)) + 1
-            print(f"⚠️ Telegram RetryAfter. Esperando {wait}s...")
-            await asyncio.sleep(wait)
-        except (TimedOut, NetworkError) as e:
-            print(f"⚠️ Telegram timeout/red. Reintentando en {backoff}s... {repr(e)}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        except Exception as e:
-            # Cualquier cosa inesperada: reintenta sin matar el proceso
-            print(f"⚠️ Error enviando a Telegram. Reintentando en {backoff}s... {repr(e)}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+        await asyncio.sleep(60)
+        if (time.time() - LAST_SIGNAL_TS) > MAX_SILENCE_SECONDS:
+            os._exit(1)  # reinicio silencioso (Railway lo re-lanza)
 
 # ===============================
-# 🚀 AUTO-SEÑALES (siempre vivo)
+# 🚀 AUTO-SEÑALES (robusto, silencioso)
 # ===============================
 async def auto_signals(app: Application):
-    if CHAT_ID is None:
-        print("⚠️ Auto-señales desactivadas (CHAT_ID)")
-        return
+    global LAST_SIGNAL_TS
 
     while True:
         try:
-            pair = pick_pair(get_active_pairs())
-            msg = await asyncio.to_thread(build_signal, pair)
+            active_pairs = get_active_pairs()
+            pair = pick_pair(active_pairs)
 
-            # Enviar robusto (no se cae por Telegram)
-            await send_with_retry(app, CHAT_ID, msg)
+            # build_signal con timeout (para que nunca se quede pegado)
+            msg = await asyncio.wait_for(asyncio.to_thread(build_signal, pair), timeout=BUILD_SIGNAL_TIMEOUT)
 
-            # ritmo 2–3–4 min
-            await asyncio.sleep(random.choice([120, 180, 240]))
+            # send_message con timeout
+            await asyncio.wait_for(
+                app.bot.send_message(chat_id=CHAT_ID, text=msg, disable_web_page_preview=True),
+                timeout=SEND_TIMEOUT
+            )
 
-        except Exception as e:
-            # Nunca muere: si algo explota, respira y sigue
-            print("⚠️ Auto loop error:", repr(e))
-            await asyncio.sleep(5)
+            # ✅ Solo cuando se envía de verdad
+            LAST_SIGNAL_TS = time.time()
 
-# ===============================
-# 📟 MENÚ
-# ===============================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pairs = get_active_pairs()
-    await update.message.reply_text(
-        "🔱 ARKANE BOT 🦂\nPares activos:\n\n" + "\n".join(pairs),
-        reply_markup=ReplyKeyboardMarkup([[p] for p in pairs], resize_keyboard=True)
-    )
+            await asyncio.sleep(random.choice(WAIT_OPTIONS))
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text not in get_active_pairs():
-        await update.message.reply_text("Par no disponible ahora.")
-        return
-    msg = await asyncio.to_thread(build_signal, update.message.text)
-    await update.message.reply_text(msg)
+        except Exception:
+            # Silencioso: no prints, no mensajes. Solo espera un poco y reintenta.
+            await asyncio.sleep(8)
 
 # ===============================
-# 🟢 MAIN (arranque correcto, sin warnings)
+# 🟢 MAIN (solo señales, nada más)
 # ===============================
-async def run_bot_forever():
-    # Timeouts más largos para evitar TimedOut en getMe/startup
-    request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
-
-    app = Application.builder().token(TOKEN).request(request).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Arranque manual (evita "coroutine was never awaited")
-    while True:
-        try:
-            print("🔥 ARKANE BOT ONLINE (Railway)")
-            await app.initialize()
-            await app.start()
-            # Inicia polling y espera idle
-            await app.updater.start_polling(drop_pending_updates=True)
-            asyncio.create_task(auto_signals(app))
-            await app.updater.idle()
-        except (TimedOut, NetworkError) as e:
-            print(f"⚠️ Telegram timeout/red en main. Reiniciando en 10s... {repr(e)}")
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"⚠️ Error main inesperado. Reiniciando en 10s... {repr(e)}")
-            await asyncio.sleep(10)
-        finally:
-            try:
-                await app.updater.stop()
-            except Exception:
-                pass
-            try:
-                await app.stop()
-            except Exception:
-                pass
-            try:
-                await app.shutdown()
-            except Exception:
-                pass
+async def post_init(app: Application):
+    # Lanzar auto señales + watchdog (ambos silenciosos)
+    asyncio.create_task(auto_signals(app))
+    asyncio.create_task(watchdog())
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("Falta TOKEN")
-    asyncio.run(run_bot_forever())
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    # ✅ NO handlers: no /start, no respuestas, nada.
+    # ✅ Solo auto-señales al canal.
+
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
+
